@@ -29,7 +29,6 @@ use ffi;
 use key;
 use key::SecretKey;
 use super::{Message, Signature};
-use rand::{Rng, OsRng};
 use serde::{ser, de};
 
 /// A Pedersen commitment
@@ -195,6 +194,62 @@ impl RangeProof {
 	}
 }
 
+/// A message encoded in a range proof.
+pub struct ProofMessage(Vec<u8>);
+
+impl ProofMessage {
+	/// Returns the empty message.
+	pub fn empty() -> ProofMessage {
+		ProofMessage(vec![])
+	}
+
+	/// Converts a vector of bytes to a message.
+	pub fn from_bytes(array: &[u8]) -> ProofMessage {
+		let mut msg = vec![];
+		for &value in array {
+			msg.push(value);
+		}
+		ProofMessage(msg)
+	}
+
+	/// Returns a byte slice of the message.
+	pub fn as_bytes(&self) -> &[u8] {
+			self.0.iter().as_slice()
+	}
+
+	/// Returns a raw pointer to the message buffer.
+	pub fn as_ptr(&self) -> *const u8 {
+		self.0.as_ptr()
+	}
+
+	/// Returns the length of the message
+	pub fn len(&self) -> usize {
+		self.0.len()
+	}
+
+	/// Truncate message to known length
+	pub fn truncate(&mut self, len: usize) {
+		self.0.truncate(len)
+	}
+}
+
+impl ::std::cmp::PartialEq for ProofMessage {
+	fn eq(&self, other: &ProofMessage) -> bool {
+		self.0[..] == other.0[..]
+	}
+}
+impl ::std::cmp::Eq for ProofMessage {}
+
+impl ::std::fmt::Debug for ProofMessage {
+	fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+		try!(write!(f, "{}(", stringify!(ProofMessage)));
+		for i in self.0.iter().cloned() {
+			try!(write!(f, "{:02x}", i));
+		}
+		write!(f, ")")
+	}
+}
+
 /// The range that was proven
 #[derive(Debug)]
 pub struct ProofRange {
@@ -205,13 +260,14 @@ pub struct ProofRange {
 }
 
 /// Information about a valid proof after rewinding it.
+#[derive(Debug)]
 pub struct ProofInfo {
 	/// Whether the proof is valid or not
 	pub success: bool,
 	/// Value that was used by the commitment
 	pub value: u64,
 	/// Message embedded in the proof
-	pub message: [u8; constants::PROOF_MSG_SIZE],
+	pub message: ProofMessage,
 	/// Length of the embedded message
 	pub mlen: i32,
 	/// Min value that was proven
@@ -382,15 +438,6 @@ impl Secp256k1 {
 		SecretKey::from_slice(self, &ret)
 	}
 
-	/// Convenience function for generating a random nonce for a range proof.
-	/// We will need the nonce later if we want to rewind the range proof.
-	pub fn nonce(&self) -> [u8; 32] {
-	    let mut rng = OsRng::new().unwrap();
-	    let mut nonce = [0u8; 32];
-	    rng.fill_bytes(&mut nonce);
-	    nonce
-	}
-
 	// I have no idea what I'm doing but cribbing this from secp256k1-zkp seems to have
 	// cleaned up some of the test failures...
 	fn generator_h(&self) -> [u8; 33] {
@@ -410,15 +457,18 @@ impl Secp256k1 {
 		value: u64,
 		blind: SecretKey,
 		commit: Commitment,
-		nonce: [u8; 32]
+		message: &ProofMessage,
 	) -> RangeProof {
 		let mut retried = false;
 		let mut proof = [0; constants::MAX_PROOF_SIZE];
 		let mut plen = constants::MAX_PROOF_SIZE as size_t;
-		let message = [0u8; 32];
 
 		let extra_commit = [0u8; 33];
 		let gen = self.generator_h();
+
+		// here we use a "known key" as the nonce, specifically the blinding factor
+		// of the commitment for which we are generating the range proof
+		let nonce = blind.clone();
 
 		// TODO - confirm this reworked retry logic works as expected
 		// pretty sure the original approach retried on success (so twice in total)
@@ -439,7 +489,7 @@ impl Secp256k1 {
 					64,
 					value,
 					message.as_ptr(),
-					0 as size_t,
+					message.len() as size_t,
 					extra_commit.as_ptr(),
 					0 as size_t,
 					gen.as_ptr(),
@@ -501,12 +551,12 @@ impl Secp256k1 {
 		&self,
 		commit: Commitment,
 		proof: RangeProof,
-		nonce: [u8; 32]
+		nonce: SecretKey,
 	) -> ProofInfo {
 		let mut value: u64 = 0;
 		let mut blind: [u8; 32] = unsafe { mem::uninitialized() };
-		let mut message = [0u8; constants::PROOF_MSG_SIZE];
-		let mut mlen: size_t = 0;
+		let mut message: [u8; constants::PROOF_MSG_SIZE] = unsafe { mem::uninitialized() };
+		let mut mlen: size_t = constants::PROOF_MSG_SIZE as size_t;
 		let mut min: u64 = 0;
 		let mut max: u64 = 0;
 
@@ -531,10 +581,14 @@ impl Secp256k1 {
 				gen.as_ptr(),
 			) == 1
 		};
+
+		// the recovered blinding factor must be equal to the nonce here
+		// assert!(blinding == nonce);
+
 		ProofInfo {
 			success: success,
 			value: value,
-			message: message,
+			message: ProofMessage::from_bytes(&message),
 			mlen: mlen as i32,
 			min: min,
 			max: max,
@@ -571,7 +625,7 @@ impl Secp256k1 {
 		ProofInfo {
 			success: success,
 			value: 0,
-			message: [0; constants::PROOF_MSG_SIZE],
+			message: ProofMessage::empty(),
 			mlen: 0,
 			min: min,
 			max: max,
@@ -583,23 +637,24 @@ impl Secp256k1 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Commitment, Message, Secp256k1};
-    use ContextFlag;
-    use key::{ONE_KEY, ZERO_KEY, SecretKey};
+	use super::{Commitment, Message, ProofMessage, Secp256k1};
 
-    use rand::os::OsRng;
+	use ContextFlag;
+	use key::{ONE_KEY, ZERO_KEY, SecretKey};
+
+	use rand::os::OsRng;
 	use rand::{Rng, thread_rng};
 
 
-    #[test]
-    fn test_verify_commit_sum_zero_keys() {
-        let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	#[test]
+	fn test_verify_commit_sum_zero_keys() {
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
 
-        fn commit(value: u64) -> Commitment {
-            let secp = Secp256k1::with_caps(ContextFlag::Commit);
-            let blinding = ZERO_KEY;
-            secp.commit(value, blinding).unwrap()
-        }
+		fn commit(value: u64) -> Commitment {
+			let secp = Secp256k1::with_caps(ContextFlag::Commit);
+			let blinding = ZERO_KEY;
+			secp.commit(value, blinding).unwrap()
+		}
 
         assert!(secp.verify_commit_sum(
             vec![],
@@ -756,11 +811,10 @@ mod tests {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
 		let blinding = SecretKey::new(&secp, &mut OsRng::new().unwrap());
 		let commit = secp.commit(7, blinding).unwrap();
-		let nonce = secp.nonce();
-		let range_proof = secp.range_proof(0, 7, blinding, commit, nonce);
-		let proof_range = secp.verify_range_proof(commit, range_proof).unwrap();
 
-		assert_eq!(proof_range.min, 0);
+		let message = ProofMessage::empty();
+		let range_proof = secp.range_proof(0, 7, blinding, commit, &message);
+		secp.verify_range_proof(commit, range_proof).unwrap();
 
 		let proof_info = secp.range_proof_info(range_proof);
 		assert!(proof_info.success);
@@ -768,25 +822,95 @@ mod tests {
 		// check we get no information back for the value here
 		assert_eq!(proof_info.value, 0);
 
-		let proof_info = secp.rewind_range_proof(commit, range_proof, nonce);
+		let proof_info = secp.rewind_range_proof(commit, range_proof, blinding);
 		assert!(proof_info.success);
 		assert_eq!(proof_info.min, 0);
 		assert_eq!(proof_info.value, 7);
 
 		// check we cannot rewind a range proof without the original nonce
-		let bad_nonce = secp.nonce();
-		let bad_info = secp.rewind_range_proof(commit, range_proof, bad_nonce);
+		let bad_key = SecretKey::new(&secp, &mut OsRng::new().unwrap());
+		let bad_info = secp.rewind_range_proof(commit, range_proof, bad_key);
 		assert_eq!(bad_info.success, false);
 		assert_eq!(bad_info.value, 0);
 
 		// check we can construct and verify a range proof on value 0
 		let commit = secp.commit(0, blinding).unwrap();
-		let nonce = secp.nonce();
-		let range_proof = secp.range_proof(0, 0, blinding, commit, nonce);
+		let message = ProofMessage::empty();
+		let range_proof = secp.range_proof(0, 0, blinding, commit, &message);
 		secp.verify_range_proof(commit, range_proof).unwrap();
-		let proof_info = secp.rewind_range_proof(commit, range_proof, nonce);
+		let proof_info = secp.rewind_range_proof(commit, range_proof, blinding);
 		assert!(proof_info.success);
 		assert_eq!(proof_info.min, 0);
 		assert_eq!(proof_info.value, 0);
-	}
+
+		// non-zero min on valid range proof
+        let commit = secp.commit(1, blinding).unwrap();
+        let message = ProofMessage::empty();
+        let range_proof = secp.range_proof(1, 1, blinding, commit, &message);
+        secp.verify_range_proof(commit, range_proof).unwrap();
+        let proof_info = secp.rewind_range_proof(commit, range_proof, blinding);
+        assert!(proof_info.success);
+        assert_eq!(proof_info.min, 1);
+        assert_eq!(proof_info.value, 1);
+
+        // this actually hangs and does not return - do we need to handle this?
+        // non-zero min with invalid range proof
+        // let commit = secp.commit(0, blinding).unwrap();
+        // let message = ProofMessage::empty();
+        // let range_proof = secp.range_proof(1, 0, blinding, commit, &message);
+        // secp.verify_range_proof(commit, range_proof).unwrap();
+        // let proof_info = secp.rewind_range_proof(commit, range_proof, blinding);
+        // assert!(proof_info.success);
+        // assert_eq!(proof_info.min, 1);
+        // assert_eq!(proof_info.value, 1);
+    }
+
+    /// test that we can pass a message in when creating a range proof
+    /// and successfully read the message back on rewind
+    #[test]
+    fn test_range_proof_message() {
+        let secp = Secp256k1::with_caps(ContextFlag::Commit);
+        let blinding = SecretKey::new(&secp, &mut OsRng::new().unwrap());
+        let commit = secp.commit(7, blinding).unwrap();
+
+        let message = ProofMessage(vec![1, 2, 3, 4]);
+        let range_proof = secp.range_proof(0, 7, blinding, commit, &message);
+        let mut proof_info = secp.rewind_range_proof(commit, range_proof, blinding);
+
+        assert!(proof_info.success);
+
+        proof_info.message.truncate(4);
+        assert_eq!(proof_info.message, message);
+        assert_eq!(proof_info.message, ProofMessage(vec![1, 2, 3, 4]));
+
+        // now check we can pass in an arbitrary string as the message
+        let message = ProofMessage::from_bytes(String::from("this is a test message").as_bytes());
+        let range_proof = secp.range_proof(0, 7, blinding, commit, &message);
+        let mut proof_info = secp.rewind_range_proof(commit, range_proof, blinding);
+
+        proof_info.message.truncate("this is a test message".len());
+        assert_eq!(proof_info.message, message);
+        assert_eq!(String::from_utf8(proof_info.message.as_bytes().to_vec()).unwrap(), "this is a test message");
+    }
+
+    #[test]
+    fn test_proof_message() {
+        let message = ProofMessage::empty();
+        assert_eq!(message.len(), 0);
+        assert_eq!(message.as_bytes().len(), 0);
+
+        let message = ProofMessage(vec![1, 2, 3, 4]);
+        assert_eq!(message.len(), 4);
+
+        let bytes = message.as_bytes();
+        assert_eq!(message.as_bytes(), [1, 2, 3, 4]);
+
+        assert_eq!(message, ProofMessage::from_bytes(bytes));
+
+        let mut message = ProofMessage(vec![1, 2, 3, 4]);
+        message.truncate(3);
+        assert_eq!(message.len(), 3);
+        assert_eq!(message.as_bytes(), [1, 2, 3]);
+        assert_eq!(message, ProofMessage(vec![1, 2, 3]));
+    }
 }
