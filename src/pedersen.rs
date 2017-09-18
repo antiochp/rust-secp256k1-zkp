@@ -637,7 +637,7 @@ impl Secp256k1 {
 
 #[cfg(test)]
 mod tests {
-	use super::{Commitment, Message, ProofMessage, Secp256k1};
+	use super::{Commitment, Error, Message, ProofMessage, Secp256k1};
 
 	use ContextFlag;
 	use key::{ONE_KEY, ZERO_KEY, SecretKey};
@@ -844,26 +844,31 @@ mod tests {
 		assert_eq!(proof_info.value, 0);
 
 		// non-zero min on valid range proof
-        let commit = secp.commit(1, blinding).unwrap();
-        let message = ProofMessage::empty();
-        let range_proof = secp.range_proof(1, 1, blinding, commit, &message);
-        secp.verify_range_proof(commit, range_proof).unwrap();
-        let proof_info = secp.rewind_range_proof(commit, range_proof, blinding);
-        assert!(proof_info.success);
-        assert_eq!(proof_info.min, 1);
-        assert_eq!(proof_info.value, 1);
+		let commit = secp.commit(1, blinding).unwrap();
+		let message = ProofMessage::empty();
+		let range_proof = secp.range_proof(1, 1, blinding, commit, &message);
+		secp.verify_range_proof(commit, range_proof).unwrap();
+		let proof_info = secp.rewind_range_proof(commit, range_proof, blinding);
+		assert!(proof_info.success);
+		assert_eq!(proof_info.min, 1);
+		assert_eq!(proof_info.value, 1);
 
-        // this actually hangs and does not return - do we need to handle this?
-        // non-zero min with invalid range proof
-        // let commit = secp.commit(0, blinding).unwrap();
-        // let message = ProofMessage::empty();
-        // let range_proof = secp.range_proof(1, 0, blinding, commit, &message);
-        // secp.verify_range_proof(commit, range_proof).unwrap();
-        // let proof_info = secp.rewind_range_proof(commit, range_proof, blinding);
-        // assert!(proof_info.success);
-        // assert_eq!(proof_info.min, 1);
-        // assert_eq!(proof_info.value, 1);
-    }
+		// this actually hangs and does not return - do we need to handle this?
+		// non-zero min with invalid range proof
+		let commit = secp.commit(0, blinding).unwrap();
+		let message = ProofMessage::empty();
+		let range_proof = secp.range_proof(1, 0, blinding, commit, &message);
+		let result = secp.verify_range_proof(commit, range_proof);
+		match result {
+			Err(Error::InvalidRangeProof) => {},
+			_ => panic!("expected an InvalidRangeProf error here"),
+		}
+
+		let proof_info = secp.rewind_range_proof(commit, range_proof, blinding);
+		assert_eq!(proof_info.success, false);
+		assert_eq!(proof_info.min, 0);
+		assert_eq!(proof_info.value, 0);
+	}
 
     /// test that we can pass a message in when creating a range proof
     /// and successfully read the message back on rewind
